@@ -1,0 +1,133 @@
+
+name: Build and deploy ASP.Net Core app to an Azure Web App
+
+env:
+  AZURE_WEBAPP_NAME: vs-test-dotnet-app    # set this to the name of your Azure Web App
+  AZURE_WEBAPP_PACKAGE_PATH: '.'      # set this to the path to your web app project, defaults to the repository root
+  DOTNET_VERSION: '8'                 # set this to the .NET Core version to use
+  SONAR_HOST_URL: https://sonarcloud.io
+  SONAR_PROJECT_KEY:  vs-project-1 # Sonarqube project name
+  SONAR_ORGANIZATION: vs-test-org # Sonarqube Organization name
+
+on:
+  push:
+    branches: [ "dev" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: 03-app-dotnet
+        
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up .NET Core
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+   
+      - name: Set up dependency caching for faster builds
+        uses: actions/cache@v3
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/packages.lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+            
+      - name: Build with dotnet
+        run: dotnet build --configuration Release
+      - name: Restore .NET packages
+        run: dotnet restore
+        
+      - name: Install Snyk CLI
+        run: npm install -g snyk
+
+      - name: Auth with Snyk
+        run: snyk auth ${{ secrets.SNYK_TOKEN }}
+  
+      - name: Snyk test for vulnerabilities
+        run: snyk test --project-name=my-dotnet-app --package-manager=nuget
+
+    # Optional: Monitor to see updates over time in the Snyk dashboard
+      - name: Monitor project in Snyk
+        run: snyk monitor --file=app-dotnet.csproj
+      
+      - name: Cache SonarQube Cloud packages
+        uses: actions/cache@v4
+        with:
+          path: ~\sonar\cache
+          key: ${{ runner.os }}-sonar
+          restore-keys: ${{ runner.os }}-sonar
+          
+      - name: Cache SonarQube Cloud scanner
+        id: cache-sonar-scanner
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\scanner
+          key: ${{ runner.os }}-sonar-scanner
+          restore-keys: ${{ runner.os }}-sonar-scanner
+          
+      - name: Install SonarQube Cloud scanner
+        shell: pwsh
+        run: |
+          New-Item -Path ${{ runner.temp }}\scanner -ItemType Directory
+          dotnet tool update dotnet-sonarscanner --tool-path ${{ runner.temp }}\scanner
+                 
+
+      - name: Build and analyze
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        shell: pwsh
+        run: |
+          ${{ runner.temp }}\scanner\dotnet-sonarscanner begin /k:"vs-test-org-vs-project-1" /o:"vs-test-org" /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
+          dotnet build
+          ${{ runner.temp }}\scanner\dotnet-sonarscanner end /d:sonar.token="${{ secrets.SONAR_TOKEN }}"
+          
+      - name: Upload coverage report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: '**/coverage.opencover.xml'
+  
+      - name: Upload Sonar Scanner folder artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonar-scanner-files
+          path: .sonarqube/**
+      
+      - name: dotnet publish
+        run: dotnet publish -c Release -o ${{env.DOTNET_ROOT}}/myapp
+
+      - name: Upload artifact for deployment job
+        uses: actions/upload-artifact@v4
+        with:
+          name: .net-app
+          path: ${{env.DOTNET_ROOT}}/myapp
+
+  deploy:
+    permissions:
+      contents: none
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: 'dev'
+      url: ${{ steps.deploy-to-webapp.outputs.webapp-url }}
+
+    steps:
+      - name: Download artifact from build job
+        uses: actions/download-artifact@v4
+        with:
+          name: .net-app
+
+      - name: Deploy to Azure Web App
+        id: deploy-to-webapp
+        uses: azure/webapps-deploy@v2
+        with:
+          publish-profile: ${{ secrets.azureWebAppPublishProfile }}
+          #app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          #package: ${{ env.AZURE_WEBAPP_PACKAGE_PATH }}
